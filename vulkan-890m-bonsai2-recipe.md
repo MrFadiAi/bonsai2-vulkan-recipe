@@ -33,7 +33,17 @@ mingw32-make -C build-dspark -j8 llama-server
 
 ⚠️ **Kill any running `llama-server.exe` BEFORE relinking** — on Windows the linker fails with "Permission denied" if the exe is loaded, and you may silently benchmark a stale binary.
 
-## 3. Production launch flags
+## 3. The model: stock GGUFs will NOT reproduce this (graft required)
+
+The speed comes from `--spec-type draft-mtp` — but **PrismML ships all Bonsai 2 GGUFs WITHOUT the MTP head** (layers 0–63 only, nextn stripped). A stock file cannot run speculative decoding. The champion file (`Bonsai-2-27B-Q2_0-fork-MTP.gguf`) is:
+
+1. **Base**: Q2_0-fork GGUF from [`prism-ml/Ternary-Bonsai-2-27B-gguf`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
+2. **Grafted MTP head**: the 15 `blk.64.*` (nextn) tensors range-requested from unsloth's `Qwen3.8-27B` GGUF (~340 MB, not the full 17 GB) via the community `graft_mtp.py`; metadata `block_count 64→65`, `nextn_predict_layers=1`. Verbatim copy is valid because Bonsai's RMSNorm weights match stock Qwen3.8 elementwise (cos > 0.99996) — the residual stream stays in the original basis.
+3. **Hadamard-inverse patch** in the MTP graph (shipped in PR #187 commit `4b8092c3`): the draft graph's embedding lookup must apply the inverse Hadamard rotation (rotation first, sign flip second) or the server dies at context init.
+
+⚠️ **Build from the PR #187 branch, NOT upstream main** — until it merges, upstream lacks the bf16 state pools, the fused GDN rows-mode kernel, the Q2fork matvec, and the Hadamard fix. A stock build either refuses the Q2fork format or runs it on CPU.
+
+## 4. Production launch flags
 
 ```bash
 LLAMA_SSM_BF16_STATE=1 ./llama-server \
@@ -51,10 +61,10 @@ LLAMA_SSM_BF16_STATE=1 ./llama-server \
 | `--spec-draft-n-max 1` | n=1 is optimal on iGPU. n=2 collapses acceptance (0.84 → 0.44) and loses 15% speed. The draft chain costs more than it earns at shared-memory bandwidth. |
 | `-ngl 99 -ngld 99` | Full offload of target AND draft. Everything must fit in VRAM — spilling to CPU caps you at 2–3 t/s. |
 | `-fa on` | Flash attention |
-| `-t 24` | All 24 threads; 32 is no better, 16 is worse |
+| `-t 24 -td 8` | Target threads = all 24; draft threads = 8 (16 oversubscribes against the target). Try both head placements on new hardware: GPU head (`-ngld 99`) won here; on machines with a stronger CPU:GPU ratio, CPU head (`-ngld 0 -td 8`) can win by overlapping. |
 | `-np 8` (batch mode) | For multi-user serving: ~14.3 t/s aggregate across 8 streams |
 
-## 4. Measured results
+## 5. Measured results
 
 | Configuration | Speed | Notes |
 |---|---|---|
@@ -70,7 +80,7 @@ LLAMA_SSM_BF16_STATE=1 ./llama-server \
 
 Effective bandwidth: ~180 GB/s sustained on LPDDR5X — this is the hardware wall for a weights-streaming workload on unified memory.
 
-## 5. Findings that will save you days
+## 6. Findings that will save you days
 
 1. **Raw-gates fusion is CPU/Metal/CUDA-only upstream — keep it that way on Vulkan.** The `qwen35.cpp` device allowlist deliberately excludes Vulkan from the raw-gates path. Enabling it produces corrupted output (`////`) in every shader variant (subgroup, nocluster, shmem). We verified this is a real incompatibility, not a stale allowlist.
 
@@ -84,7 +94,7 @@ Effective bandwidth: ~180 GB/s sustained on LPDDR5X — this is the hardware wal
 
 6. **VRAM wall rule:** model must fit fully in VRAM. A 17 GB model on 14.4 GB usable VRAM = 2.5 t/s (CPU spillover); the same class of model at 10 GB = 5.9 t/s; specialized 7.4 GB = 14 t/s.
 
-## 6. Related commits (PR #187)
+## 7. Related commits (PR #187)
 
 - `905c29b6` PTQ1_0 decode: trit-table + vectorized dequantize4, MUL+FWHT fusion
 - `a078ce98` review feedback
@@ -94,7 +104,7 @@ Effective bandwidth: ~180 GB/s sustained on LPDDR5X — this is the hardware wal
 - `96062463` GDN rows-mode + bf16 state read (fused)
 - `6e17c24d` build fix + tail-guard hoist
 
-## 7. Reproducibility notes
+## 8. Reproducibility notes
 
 - Numbers are single-stream, temperature 0.1, 300-token generations, measured server-side (`eval time`) and cross-checked over HTTP.
 - Quality gate: 5/5 exact-answer checks (arithmetic, knowledge, sequence, translation, word problem) — spec-decode must not degrade answers.
